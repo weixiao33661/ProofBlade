@@ -14,7 +14,7 @@ import { resolveOutputRewriteConfig, type ProofBladeConfig } from "../config.js"
 import type { ControlStore } from "../control/control-store.js";
 import { prepareContextMaintenance } from "../context/maintenance-coordinator.js";
 import { ContextCompiler } from "../context/compiler.js";
-import { latestExternalUserMessage } from "../context/user-task-anchor.js";
+import { latestExternalUserMessage, userMessageText } from "../context/user-task-anchor.js";
 import { CheckpointService } from "../context/checkpoint.js";
 import { DurableCompactionCoordinator } from "../context/durable-compaction.js";
 import { canonicalJson, estimateTokens, sha256 } from "../domain/utils.js";
@@ -63,9 +63,12 @@ import type { ExternalResourceRegistry } from "../recovery/external-resource-reg
 import type { SessionRuntimeHandoff } from "../recovery/session-resource-adapter.js";
 import type { SessionRuntimeCreateBroker } from "../recovery/session-resource-adapter.js";
 import { preflightSessionRuntimeBrokers, type SessionRuntimePreflight } from "../recovery/session-runtime-composition.js";
+import { routeSkillsForTask, type SkillRoute } from "./skill-routing.js";
 const MAX_CONTEXT_PROJECTION_MESSAGE_TOKENS = 10_000;
 /** Hard Provider-facing budget for user-managed project instructions. */
 export const MAX_PROJECT_PROMPT_TOKENS = 2_048;
+/** Bounded body size for each automatically routed specialist Skill. */
+const MAX_ROUTED_SKILL_CHARS = 5_000;
 
 const CODING_SYSTEM_PROMPT = `You are ProofBlade (证锋), a coding agent working with the user in their current project workspace.
 
@@ -662,7 +665,16 @@ export class PiCodingLane implements AgentLanePort {
         previousBlocks: previousContextBlocks,
       });
       previousContextBlocks = compiled.manifest.blocks;
-      const dynamicProjection = contextProjectionMessage(compiled, turnContext.guidance);
+      const taskPrompt = userMessageText(latestExternalUserMessage(messages));
+      const routingTask = taskPrompt
+        ? { ...current.task, objective: `${current.task.objective}\n${taskPrompt}` }
+        : current.task;
+      const routedSkillGuidance = renderRoutedSkillGuidance(
+        routeSkillsForTask(routingTask, resources.map((skill) => skill.name)),
+        skills,
+      );
+      const dynamicGuidance = [turnContext.guidance, routedSkillGuidance].filter(Boolean).join("\n\n");
+      const dynamicProjection = contextProjectionMessage(compiled, dynamicGuidance);
       const contextPrefix = forestContext.value
         ? [createCustomMessage(
           "proofblade_reasoning_forest",
@@ -1166,6 +1178,25 @@ function codingSystemPrompt(
     ? `\n\nMCP path boundary: shell/read/edit/write operate on the container workspace at \`${workspaceRoot}\`. Host-side MCP tools (for example IDA/JADX) cannot see that virtual path; when an MCP tool asks for a file path, pass the host workspace path \`${options.hostWorkspaceRootForMcp}\` plus the workspace-relative suffix. Never use that host path in bash.`
     : "";
   return `${CODING_SYSTEM_PROMPT}\n\n${codingHostGuidance(options.executionPlatform ?? process.platform)}${workspaceBlock}${toolCatalogBlock}${nativeSkills}${mcpBlock}${mcpPathBlock}`;
+}
+
+/** Render deterministic specialist guidance without making a Provider/tool call. */
+function renderRoutedSkillGuidance(routes: readonly SkillRoute[], skills: ProofBladeSkillRegistry): string {
+  if (routes.length === 0) return "";
+  const blocks = routes.flatMap((route) => {
+    try {
+      const loaded = skills.loadForModel(route.name, MAX_ROUTED_SKILL_CHARS);
+      return [`### ${route.name} (automatically selected: ${route.reasons.join("; ")})\n${loaded.content}`];
+    } catch {
+      // A catalog can change between preflight and lane construction. The
+      // explicit load_skill tool remains available; automatic guidance is
+      // advisory and must never make the lane unavailable.
+      return [];
+    }
+  });
+  return blocks.length > 0
+    ? `## Automatically routed specialist guidance\nThe following bounded Skill bodies were selected from immutable task metadata and input names. They are methodology only, not evidence; keep all conclusions bound to workspace artifacts and verifier rules.\n\n${blocks.join("\n\n")}`
+    : "";
 }
 
 export function codingHostGuidance(platform: NodeJS.Platform = process.platform): string {
