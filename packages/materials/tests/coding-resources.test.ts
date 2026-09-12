@@ -26,6 +26,8 @@ import type { ProofBladeConfig } from "../src/config.js";
 import { CodingClaimVerifier, requiresClaimVerification, TaskResultVerifier } from "../src/verification/claim-verification.js";
 import { CodingEvidenceGraph } from "../src/knowledge/evidence-graph.js";
 import { EvidenceCurationGate } from "../src/knowledge/evidence-curation-gate.js";
+import { RunCoordinator } from "../src/orchestration/run-coordinator.js";
+import { ContextCompiler } from "../src/context/compiler.js";
 import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -36,7 +38,7 @@ import { join, resolve } from "node:path";
  * ONLY together with a deliberate tool-contract change — the provider prompt
  * cache prefix depends on this shape.
  */
-const CODING_TOOL_CONTRACT_HASH = "819d224d1ed8e5d3bab818b2eefe33fd220f7f25f4b2ddf57244ca45013958b9";
+const CODING_TOOL_CONTRACT_HASH = "cc3b092c6b8558371f59d265eb25ab00c27a60dadcd8999ad4381122bdc503c6";
 
 test("TaskResultVerifier is the canonical verifier and keeps the legacy class as a compatibility alias", () => {
   assert.equal(Object.getPrototypeOf(CodingClaimVerifier.prototype), TaskResultVerifier.prototype);
@@ -44,7 +46,7 @@ test("TaskResultVerifier is the canonical verifier and keeps the legacy class as
 
 test("coding provider tools keep stable Skill, Capability, and MCP proxy contracts", () => {
   const snapshot = codingProviderToolContractSnapshot();
-  assert.deepEqual(snapshot.map((tool) => tool.name), ["read", "bash", "edit", "write", "glob", "grep", "verify_result", "evidence", "load_skill", "capability", "mcp_call", "shell_background", "shell_job", "pwn_open", "pwn_send", "pwn_recv", "pwn_signal", "pwn_close", "pwn_list", "pwn_record_primitive", "pwn_reproduce"]);
+  assert.deepEqual(snapshot.map((tool) => tool.name), ["read", "bash", "edit", "write", "glob", "grep", "update_phase", "verify_result", "evidence", "load_skill", "capability", "mcp_call", "shell_background", "shell_job", "pwn_open", "pwn_send", "pwn_recv", "pwn_signal", "pwn_close", "pwn_list", "pwn_record_primitive", "pwn_reproduce"]);
   assert.equal(sha256(canonicalJson(snapshot)), CODING_TOOL_CONTRACT_HASH);
   assert.equal(snapshot.some((tool) => tool.name === "verify_claim"), false);
   assert.equal(createCodingTools({ externalSubmissionEnabled: true }).some((tool) => tool.name === "submit_flag"), false);
@@ -52,7 +54,7 @@ test("coding provider tools keep stable Skill, Capability, and MCP proxy contrac
 
   const withoutResources = codingActiveToolNames({ tools: ["read", "bash"], skills: [], mcpServers: [] });
   const withResources = codingActiveToolNames({ tools: ["read", "bash"], skills: ["triage"], mcpServers: ["echo", "browser"] });
-  assert.deepEqual(withoutResources, ["read", "bash", "verify_result", "evidence", "load_skill", "capability", "mcp_call", "shell_background", "shell_job"]);
+  assert.deepEqual(withoutResources, ["read", "bash", "update_phase", "verify_result", "evidence", "load_skill", "capability", "mcp_call", "shell_background", "shell_job"]);
   assert.deepEqual(withResources, withoutResources);
   // External submission is gated on a trusted destination, not on tool selection.
   assert.equal(withoutResources.includes("submit_flag"), false);
@@ -64,6 +66,40 @@ test("coding provider tools keep stable Skill, Capability, and MCP proxy contrac
   assert.equal(platformTools.includes("submit_flag"), false);
   assert.deepEqual(codingActiveToolNames({ tools: ["bash"], skills: [], mcpServers: [], webReproductionEnabled: true }).slice(-1), ["web_reproduce"]);
   assert.deepEqual(codingActiveToolNames({ tools: ["bash"], skills: [], mcpServers: [], webSessionEnabled: true }).slice(-5), ["web_open", "web_request", "web_replay", "web_close", "web_list"]);
+});
+
+test("update_phase changes the durable phase before later investigation actions", async () => {
+  const root = await mkdtemp(join(tmpdir(), "proofblade-live-phase-"));
+  const config = {
+    schemaVersion: 1,
+    runtime: { piVersion: "0.83.0" },
+    storage: { runsDir: "runs", fixturesDir: "fixtures/runtime" },
+    modelProfiles: { executor: { thinkingLevel: "off" } },
+  } as unknown as ProofBladeConfig;
+  const services = createServices(root, config);
+  const runId = "LIVE-PHASE";
+  await services.control.createRun(runId, demoTask(runId, root, config));
+  const coordinator = new RunCoordinator(services.control);
+  const context = {
+    setDomainPhase: async (phase: "RECON" | "TARGET_MODEL" | "HYPOTHESIS" | "EXPERIMENT" | "REPRODUCE", reason: string) => {
+      await coordinator.setDomainPhase(runId, phase, reason);
+      const snapshot = await services.control.snapshot(runId);
+      return { domainPhase: snapshot.domainPhase, phase: snapshot.phase };
+    },
+  } as unknown as CodingResourceContext;
+  try {
+    const result = await executeTool("update_phase", { phase: "EXPERIMENT", reason: "The packet layout is known; execute the bounded decoder." }, context);
+    assert.deepEqual(result.details, { domainPhase: "EXPERIMENT", phase: "experiment", reason: "The packet layout is known; execute the bounded decoder." });
+    const snapshot = await services.control.snapshot(runId);
+    assert.deepEqual({ domainPhase: snapshot.domainPhase, phase: snapshot.phase }, { domainPhase: "EXPERIMENT", phase: "experiment" });
+    const compiled = new ContextCompiler().build({ runId, lane: "main", phase: snapshot.phase, task: snapshot.task, snapshot });
+    assert.match(compiled.messages.map((message) => message.content).join("\n"), /"domain_phase":"EXPERIMENT"/);
+    const phaseEvent = (await services.control.events(runId)).findLast((event) => event.type === "domain_phase_changed");
+    assert.deepEqual(phaseEvent?.payload, { domainPhase: "EXPERIMENT", reason: "The packet layout is known; execute the bounded decoder." });
+  } finally {
+    await services.sandbox.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("ordinary read follows bounded continuation pages into one complete model result", async () => {
